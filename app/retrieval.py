@@ -1,8 +1,9 @@
-
 import os
+import re
+import math
+from collections import Counter
 
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
 from sarvamai import SarvamAI
 
 
@@ -12,10 +13,7 @@ from sarvamai import SarvamAI
 
 COLLECTION_NAME = "multilingual_rag"
 
-MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-
 QDRANT_PATH = "qdrant_data"
-
 
 # ============================================================
 # SARVAM CLIENT
@@ -32,20 +30,6 @@ sarvam_client = SarvamAI(
     api_subscription_key=SARVAM_API_KEY
 )
 
-
-# ============================================================
-# EMBEDDING MODEL
-# ============================================================
-
-print("Loading retrieval model...")
-
-model = SentenceTransformer(
-    MODEL_NAME
-)
-
-print("Retrieval model loaded.")
-
-
 # ============================================================
 # QDRANT
 # ============================================================
@@ -53,7 +37,6 @@ print("Retrieval model loaded.")
 client = QdrantClient(
     path=QDRANT_PATH
 )
-
 
 # ============================================================
 # LANGUAGE MAP
@@ -65,6 +48,37 @@ LANGUAGE_CODES = {
     "mr-IN": "Marathi",
     "gu-IN": "Gujarati",
 }
+
+
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
+
+def normalize_text(text: str) -> str:
+    text = str(text or "").lower()
+
+    text = re.sub(
+        r"[^\w\s\u0900-\u097f]",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+def tokenize(text: str):
+    text = normalize_text(text)
+
+    if not text:
+        return []
+
+    return text.split()
 
 
 # ============================================================
@@ -90,14 +104,10 @@ def detect_language(text: str) -> str:
             None
         )
 
-        detected_language = LANGUAGE_CODES.get(
-            language_code
+        return LANGUAGE_CODES.get(
+            language_code,
+            "English"
         )
-
-        if detected_language:
-            return detected_language
-
-        return "English"
 
     except Exception as e:
 
@@ -107,6 +117,90 @@ def detect_language(text: str) -> str:
         )
 
         return "English"
+
+
+# ============================================================
+# SIMPLE MULTILINGUAL RELEVANCE SCORE
+# ============================================================
+
+def calculate_score(
+    query_tokens,
+    question,
+    answer,
+    paragraph,
+    title
+):
+
+    query_set = set(query_tokens)
+
+    if not query_set:
+        return 0.0
+
+    question_tokens = tokenize(question)
+    answer_tokens = tokenize(answer)
+    paragraph_tokens = tokenize(paragraph)
+    title_tokens = tokenize(title)
+
+    question_set = set(question_tokens)
+    answer_set = set(answer_tokens)
+    paragraph_set = set(paragraph_tokens)
+    title_set = set(title_tokens)
+
+    question_matches = len(
+        query_set & question_set
+    )
+
+    answer_matches = len(
+        query_set & answer_set
+    )
+
+    paragraph_matches = len(
+        query_set & paragraph_set
+    )
+
+    title_matches = len(
+        query_set & title_set
+    )
+
+    # Question is most important.
+    score = 0.0
+
+    score += (
+        question_matches
+        / max(len(query_set), 1)
+    ) * 0.55
+
+    score += (
+        answer_matches
+        / max(len(query_set), 1)
+    ) * 0.20
+
+    score += (
+        paragraph_matches
+        / max(len(query_set), 1)
+    ) * 0.20
+
+    score += (
+        title_matches
+        / max(len(query_set), 1)
+    ) * 0.05
+
+    # Small phrase bonus.
+    normalized_query = normalize_text(
+        " ".join(query_tokens)
+    )
+
+    normalized_question = normalize_text(
+        question
+    )
+
+    if (
+        normalized_query
+        and normalized_query in normalized_question
+    ):
+        score += 0.25
+
+    return min(score, 1.0)
 
 
 # ============================================================
@@ -123,78 +217,123 @@ def search_documents(
     if not query:
         return []
 
-    # ========================================================
-    # QUERY EMBEDDING
-    # ========================================================
+    query_tokens = tokenize(query)
 
-    query_vector = model.encode(
-        query,
-        normalize_embeddings=True,
-        convert_to_numpy=True
-    ).tolist()
+    if not query_tokens:
+        return []
 
-    # ========================================================
-    # QDRANT SEARCH
-    # ========================================================
+    try:
 
-    results = client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=limit,
-        with_payload=True
-    ).points
+        # ----------------------------------------------------
+        # Read payloads without loading SentenceTransformer.
+        # ----------------------------------------------------
 
-    output = []
+        offset = None
 
-    # ========================================================
-    # PROCESS RESULTS
-    # ========================================================
+        candidates = []
 
-    for result in results:
+        while True:
 
-        payload = result.payload or {}
+            points, next_offset = client.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False
+            )
 
-        output.append(
-            {
-                "text": payload.get(
-                    "text",
-                    ""
-                ),
+            for point in points:
 
-                "question": payload.get(
+                payload = point.payload or {}
+
+                question = payload.get(
                     "question",
                     ""
-                ),
+                )
 
-                "answer": payload.get(
+                answer = payload.get(
                     "answer",
                     ""
-                ),
+                )
 
-                "paragraph": payload.get(
+                paragraph = payload.get(
                     "paragraph",
                     ""
-                ),
+                )
 
-                "title": payload.get(
+                title = payload.get(
                     "title",
                     ""
-                ),
-
-                "language": payload.get(
-                    "language",
-                    ""
-                ),
-
-                "source": payload.get(
-                    "source",
-                    ""
-                ),
-
-                "score": float(
-                    result.score
                 )
-            }
+
+                score = calculate_score(
+                    query_tokens,
+                    question,
+                    answer,
+                    paragraph,
+                    title
+                )
+
+                if score <= 0:
+                    continue
+
+                candidates.append(
+                    {
+                        "text": payload.get(
+                            "text",
+                            ""
+                        ),
+
+                        "question": question,
+
+                        "answer": answer,
+
+                        "paragraph": paragraph,
+
+                        "title": title,
+
+                        "language": payload.get(
+                            "language",
+                            ""
+                        ),
+
+                        "source": payload.get(
+                            "source",
+                            ""
+                        ),
+
+                        "score": float(score)
+                    }
+                )
+
+            if next_offset is None:
+                break
+
+            offset = next_offset
+
+        # ----------------------------------------------------
+        # Sort best matches first.
+        # ----------------------------------------------------
+
+        candidates.sort(
+            key=lambda x: x["score"],
+            reverse=True
         )
 
-    return output
+        return candidates[:limit]
+
+    except Exception as e:
+
+        print()
+        print(
+            "========== SEARCH ERROR =========="
+        )
+        print(
+            repr(e)
+        )
+        print(
+            "=================================="
+        )
+        print()
+
+        return []
