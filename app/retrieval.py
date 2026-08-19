@@ -1,9 +1,8 @@
+import json
 import os
 import re
-import math
-from collections import Counter
+from functools import lru_cache
 
-from qdrant_client import QdrantClient
 from sarvamai import SarvamAI
 
 
@@ -11,12 +10,14 @@ from sarvamai import SarvamAI
 # CONFIG
 # ============================================================
 
-COLLECTION_NAME = "multilingual_rag"
+DATA_FILE = os.path.join(
+    os.path.dirname(__file__),
+    "data.json"
+)
 
-QDRANT_PATH = "qdrant_data"
 
 # ============================================================
-# SARVAM CLIENT
+# SARVAM
 # ============================================================
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
@@ -30,13 +31,6 @@ sarvam_client = SarvamAI(
     api_subscription_key=SARVAM_API_KEY
 )
 
-# ============================================================
-# QDRANT
-# ============================================================
-
-client = QdrantClient(
-    path=QDRANT_PATH
-)
 
 # ============================================================
 # LANGUAGE MAP
@@ -51,10 +45,43 @@ LANGUAGE_CODES = {
 
 
 # ============================================================
+# LOAD DATA
+# ============================================================
+
+@lru_cache(maxsize=1)
+def load_documents():
+
+    if not os.path.exists(DATA_FILE):
+        raise FileNotFoundError(
+            f"Data file not found: {DATA_FILE}"
+        )
+
+    with open(
+        DATA_FILE,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError(
+            "data.json must contain a list of documents."
+        )
+
+    print(
+        f"Loaded {len(data)} documents from data.json"
+    )
+
+    return data
+
+
+# ============================================================
 # TEXT NORMALIZATION
 # ============================================================
 
-def normalize_text(text: str) -> str:
+def normalize_text(text):
+
     text = str(text or "").lower()
 
     text = re.sub(
@@ -72,20 +99,21 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def tokenize(text: str):
+def tokenize(text):
+
     text = normalize_text(text)
 
     if not text:
-        return []
+        return set()
 
-    return text.split()
+    return set(text.split())
 
 
 # ============================================================
 # LANGUAGE DETECTION
 # ============================================================
 
-def detect_language(text: str) -> str:
+def detect_language(text):
 
     text = (text or "").strip()
 
@@ -120,10 +148,10 @@ def detect_language(text: str) -> str:
 
 
 # ============================================================
-# SIMPLE MULTILINGUAL RELEVANCE SCORE
+# SCORE DOCUMENT
 # ============================================================
 
-def calculate_score(
+def score_document(
     query_tokens,
     question,
     answer,
@@ -131,9 +159,7 @@ def calculate_score(
     title
 ):
 
-    query_set = set(query_tokens)
-
-    if not query_set:
+    if not query_tokens:
         return 0.0
 
     question_tokens = tokenize(question)
@@ -141,51 +167,47 @@ def calculate_score(
     paragraph_tokens = tokenize(paragraph)
     title_tokens = tokenize(title)
 
-    question_set = set(question_tokens)
-    answer_set = set(answer_tokens)
-    paragraph_set = set(paragraph_tokens)
-    title_set = set(title_tokens)
-
     question_matches = len(
-        query_set & question_set
+        query_tokens & question_tokens
     )
 
     answer_matches = len(
-        query_set & answer_set
+        query_tokens & answer_tokens
     )
 
     paragraph_matches = len(
-        query_set & paragraph_set
+        query_tokens & paragraph_tokens
     )
 
     title_matches = len(
-        query_set & title_set
+        query_tokens & title_tokens
     )
 
-    # Question is most important.
+    total = len(query_tokens)
+
     score = 0.0
 
+    # Question gets highest importance.
     score += (
-        question_matches
-        / max(len(query_set), 1)
-    ) * 0.55
+        question_matches / total
+    ) * 0.60
 
+    # Answer.
     score += (
-        answer_matches
-        / max(len(query_set), 1)
-    ) * 0.20
+        answer_matches / total
+    ) * 0.15
 
+    # Paragraph.
     score += (
-        paragraph_matches
-        / max(len(query_set), 1)
-    ) * 0.20
+        paragraph_matches / total
+    ) * 0.15
 
+    # Title.
     score += (
-        title_matches
-        / max(len(query_set), 1)
-    ) * 0.05
+        title_matches / total
+    ) * 0.10
 
-    # Small phrase bonus.
+    # Exact phrase bonus.
     normalized_query = normalize_text(
         " ".join(query_tokens)
     )
@@ -198,7 +220,7 @@ def calculate_score(
         normalized_query
         and normalized_query in normalized_question
     ):
-        score += 0.25
+        score += 0.20
 
     return min(score, 1.0)
 
@@ -209,7 +231,7 @@ def calculate_score(
 
 def search_documents(
     query: str,
-    limit: int = 3
+    limit: int = 5
 ):
 
     query = (query or "").strip()
@@ -224,116 +246,84 @@ def search_documents(
 
     try:
 
-        # ----------------------------------------------------
-        # Read payloads without loading SentenceTransformer.
-        # ----------------------------------------------------
-
-        offset = None
-
-        candidates = []
-
-        while True:
-
-            points, next_offset = client.scroll(
-                collection_name=COLLECTION_NAME,
-                limit=256,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False
-            )
-
-            for point in points:
-
-                payload = point.payload or {}
-
-                question = payload.get(
-                    "question",
-                    ""
-                )
-
-                answer = payload.get(
-                    "answer",
-                    ""
-                )
-
-                paragraph = payload.get(
-                    "paragraph",
-                    ""
-                )
-
-                title = payload.get(
-                    "title",
-                    ""
-                )
-
-                score = calculate_score(
-                    query_tokens,
-                    question,
-                    answer,
-                    paragraph,
-                    title
-                )
-
-                if score <= 0:
-                    continue
-
-                candidates.append(
-                    {
-                        "text": payload.get(
-                            "text",
-                            ""
-                        ),
-
-                        "question": question,
-
-                        "answer": answer,
-
-                        "paragraph": paragraph,
-
-                        "title": title,
-
-                        "language": payload.get(
-                            "language",
-                            ""
-                        ),
-
-                        "source": payload.get(
-                            "source",
-                            ""
-                        ),
-
-                        "score": float(score)
-                    }
-                )
-
-            if next_offset is None:
-                break
-
-            offset = next_offset
-
-        # ----------------------------------------------------
-        # Sort best matches first.
-        # ----------------------------------------------------
-
-        candidates.sort(
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
-        return candidates[:limit]
+        documents = load_documents()
 
     except Exception as e:
 
-        print()
         print(
-            "========== SEARCH ERROR =========="
-        )
-        print(
+            "DATA LOAD ERROR:",
             repr(e)
         )
-        print(
-            "=================================="
-        )
-        print()
 
         return []
+
+    results = []
+
+    for document in documents:
+
+        question = document.get(
+            "question",
+            ""
+        )
+
+        answer = document.get(
+            "answer",
+            ""
+        )
+
+        paragraph = document.get(
+            "paragraph",
+            ""
+        )
+
+        title = document.get(
+            "title",
+            ""
+        )
+
+        score = score_document(
+            query_tokens,
+            question,
+            answer,
+            paragraph,
+            title
+        )
+
+        if score <= 0:
+            continue
+
+        results.append(
+            {
+                "text": document.get(
+                    "text",
+                    ""
+                ),
+
+                "question": question,
+
+                "answer": answer,
+
+                "paragraph": paragraph,
+
+                "title": title,
+
+                "language": document.get(
+                    "language",
+                    ""
+                ),
+
+                "source": document.get(
+                    "source",
+                    ""
+                ),
+
+                "score": float(score)
+            }
+        )
+
+    results.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return results[:limit]
