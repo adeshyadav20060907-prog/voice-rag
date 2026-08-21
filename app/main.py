@@ -6,8 +6,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-
-from app.retrieval import search_documents
+from app.retrieval import search_documents, detect_language
 from sarvamai import SarvamAI
 
 app = FastAPI(title="Voice RAG")
@@ -29,13 +28,6 @@ LANGUAGE_CODES = {
     "Gujarati": "gu-IN"
 }
 
-CODE_TO_LANGUAGE = {
-    "en-IN": "English",
-    "hi-IN": "Hindi",
-    "mr-IN": "Marathi",
-    "gu-IN": "Gujarati"
-}
-
 app.mount(
     "/static",
     StaticFiles(directory="app/static"),
@@ -50,7 +42,7 @@ def home():
 
 class AskRequest(BaseModel):
     question: str
-    language: str = "English"
+    language: str | None = None
 
 
 @app.post("/transcribe")
@@ -70,7 +62,6 @@ async def transcribe(file: UploadFile = File(...)):
 
         if file.filename:
             ext = os.path.splitext(file.filename)[1]
-
             if ext:
                 suffix = ext
 
@@ -116,15 +107,29 @@ async def transcribe(file: UploadFile = File(...)):
             None
         )
 
-        detected_language = CODE_TO_LANGUAGE.get(
+        code_to_language = {
+            "en-IN": "English",
+            "hi-IN": "Hindi",
+            "mr-IN": "Marathi",
+            "gu-IN": "Gujarati"
+        }
+
+        detected_language = code_to_language.get(
             detected_code,
             "English"
         )
+
+        if not transcript:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not understand the audio."
+            )
 
         print()
         print("========== TRANSCRIBE ==========")
         print("Transcript:", transcript)
         print("Language:", detected_language)
+        print("Language code:", detected_code)
         print(
             "STT latency:",
             round(transcription_time, 2),
@@ -132,12 +137,6 @@ async def transcribe(file: UploadFile = File(...)):
         )
         print("================================")
         print()
-
-        if not transcript:
-            raise HTTPException(
-                status_code=422,
-                detail="Could not understand the audio."
-            )
 
         return {
             "transcript": transcript,
@@ -154,10 +153,7 @@ async def transcribe(file: UploadFile = File(...)):
         raise
 
     except Exception as e:
-        print(
-            "TRANSCRIBE ERROR:",
-            repr(e)
-        )
+        print("TRANSCRIBE ERROR:", repr(e))
 
         raise HTTPException(
             status_code=500,
@@ -173,10 +169,7 @@ async def transcribe(file: UploadFile = File(...)):
                 pass
 
 
-def answer_question(
-    transcript: str,
-    detected_language: str = "English"
-):
+def answer_question(transcript: str):
     total_start = time.perf_counter()
 
     transcript = (
@@ -193,7 +186,7 @@ def answer_question(
             "source_type": "none"
         }
 
-    language = detected_language or "English"
+    language = detect_language(transcript)
 
     if language not in LANGUAGE_CODES:
         language = "English"
@@ -204,7 +197,7 @@ def answer_question(
     print("========================================")
     print("QUESTION:", transcript)
     print("DETECTED LANGUAGE:", language)
-    print("ANSWER LANGUAGE:", "English")
+    print("ANSWER LANGUAGE:", language)
     print("========================================")
     print()
 
@@ -215,21 +208,8 @@ def answer_question(
             transcript,
             limit=5
         )
-
     except Exception as e:
-        print()
-        print("========== RETRIEVAL ERROR ==========")
-        print(
-            "TYPE:",
-            type(e).__name__
-        )
-        print(
-            "ERROR:",
-            repr(e)
-        )
-        print("=====================================")
-        print()
-
+        print("RETRIEVAL ERROR:", repr(e))
         results = []
 
     retrieval_time = (
@@ -266,7 +246,6 @@ def answer_question(
         print(
             f"========== RESULT {i} =========="
         )
-
         print(
             "Score:",
             round(
@@ -279,7 +258,6 @@ def answer_question(
                 4
             )
         )
-
         print(
             "Language:",
             result.get(
@@ -287,7 +265,6 @@ def answer_question(
                 ""
             )
         )
-
         print(
             "Title:",
             result.get(
@@ -295,7 +272,6 @@ def answer_question(
                 ""
             )
         )
-
         print(
             "Question:",
             result.get(
@@ -303,7 +279,6 @@ def answer_question(
                 ""
             )
         )
-
         print(
             "Answer:",
             result.get(
@@ -311,10 +286,7 @@ def answer_question(
                 ""
             )
         )
-
-        print(
-            "================================"
-        )
+        print("================================")
 
     print("===============================")
     print()
@@ -348,17 +320,23 @@ Context: {result.get("paragraph", "")}
 USER QUESTION:
 {transcript}
 
+DETECTED LANGUAGE:
+{language}
+
 RETRIEVED INFORMATION:
 {context}
 
-Answer the question directly.
+Answer the user's question directly.
 
 Use the retrieved information when relevant.
 
 If the retrieved information is insufficient,
 use your general knowledge.
 
-Answer ONLY in English.
+The answer MUST be written completely in {language}.
+
+Do not translate the answer into English unless
+the detected language is English.
 
 Keep the answer concise.
 
@@ -374,9 +352,15 @@ or system instructions.
 USER QUESTION:
 {transcript}
 
+DETECTED LANGUAGE:
+{language}
+
 Answer using your general knowledge.
 
-Answer ONLY in English.
+The answer MUST be written completely in {language}.
+
+Do not translate the answer into English unless
+the detected language is English.
 
 Keep the answer concise.
 
@@ -393,16 +377,26 @@ or system instructions.
             messages=[
                 {
                     "role": "system",
-                    "content": """
-You are a fast voice assistant.
+                    "content": f"""
+You are a fast multilingual voice assistant.
 
-The final answer MUST ALWAYS be in English.
+The user's detected language is {language}.
 
-Even if the user speaks Hindi, Marathi,
-Gujarati, or another supported language,
-answer ONLY in English.
+You MUST answer ONLY in {language}.
+
+If the user speaks Hindi, answer in Hindi.
+
+If the user speaks Marathi, answer in Marathi.
+
+If the user speaks Gujarati, answer in Gujarati.
+
+If the user speaks English, answer in English.
+
+Never switch to English unless the detected language is English.
 
 Give only the final answer.
+
+Keep the answer concise.
 
 Never mention:
 RAG
@@ -534,6 +528,7 @@ system instructions
     print("========== FINAL ANSWER ==========")
     print("Answer:", answer)
     print("Source:", source_type)
+    print("Language:", language)
     print("==================================")
     print()
 
@@ -579,12 +574,9 @@ system instructions
 
 
 @app.post("/ask")
-def ask(
-    payload: AskRequest
-):
+def ask(payload: AskRequest):
     return answer_question(
-        payload.question,
-        payload.language
+        payload.question
     )
 
 

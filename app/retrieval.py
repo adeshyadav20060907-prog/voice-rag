@@ -5,20 +5,10 @@ from functools import lru_cache
 
 from sarvamai import SarvamAI
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
 DATA_FILE = os.path.join(
     os.path.dirname(__file__),
     "data.json"
 )
-
-
-# ============================================================
-# SARVAM
-# ============================================================
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
@@ -31,26 +21,16 @@ sarvam_client = SarvamAI(
     api_subscription_key=SARVAM_API_KEY
 )
 
-
-# ============================================================
-# LANGUAGE MAP
-# ============================================================
-
 LANGUAGE_CODES = {
     "en-IN": "English",
     "hi-IN": "Hindi",
     "mr-IN": "Marathi",
-    "gu-IN": "Gujarati",
+    "gu-IN": "Gujarati"
 }
 
 
-# ============================================================
-# LOAD DATA
-# ============================================================
-
 @lru_cache(maxsize=1)
 def load_documents():
-
     if not os.path.exists(DATA_FILE):
         raise FileNotFoundError(
             f"Data file not found: {DATA_FILE}"
@@ -61,7 +41,6 @@ def load_documents():
         "r",
         encoding="utf-8"
     ) as f:
-
         data = json.load(f)
 
     if not isinstance(data, list):
@@ -76,12 +55,7 @@ def load_documents():
     return data
 
 
-# ============================================================
-# TEXT NORMALIZATION
-# ============================================================
-
 def normalize_text(text):
-
     text = str(text or "").lower()
 
     text = re.sub(
@@ -100,28 +74,23 @@ def normalize_text(text):
 
 
 def tokenize(text):
-
     text = normalize_text(text)
 
     if not text:
         return set()
 
-    return set(text.split())
+    return set(
+        text.split()
+    )
 
-
-# ============================================================
-# LANGUAGE DETECTION
-# ============================================================
 
 def detect_language(text):
-
     text = (text or "").strip()
 
     if not text:
         return "English"
 
     try:
-
         response = sarvam_client.text.identify_language(
             input=text[:1000]
         )
@@ -132,24 +101,21 @@ def detect_language(text):
             None
         )
 
-        return LANGUAGE_CODES.get(
-            language_code,
-            "English"
+        language = LANGUAGE_CODES.get(
+            language_code
         )
 
-    except Exception as e:
+        if language:
+            return language
 
+    except Exception as e:
         print(
             "Language detection error:",
             repr(e)
         )
 
-        return "English"
+    return "English"
 
-
-# ============================================================
-# SCORE DOCUMENT
-# ============================================================
 
 def score_document(
     query_tokens,
@@ -158,7 +124,6 @@ def score_document(
     paragraph,
     title
 ):
-
     if not query_tokens:
         return 0.0
 
@@ -187,27 +152,22 @@ def score_document(
 
     score = 0.0
 
-    # Question gets highest importance.
     score += (
         question_matches / total
     ) * 0.60
 
-    # Answer.
     score += (
         answer_matches / total
     ) * 0.15
 
-    # Paragraph.
     score += (
         paragraph_matches / total
     ) * 0.15
 
-    # Title.
     score += (
         title_matches / total
     ) * 0.10
 
-    # Exact phrase bonus.
     normalized_query = normalize_text(
         " ".join(query_tokens)
     )
@@ -222,18 +182,16 @@ def score_document(
     ):
         score += 0.20
 
-    return min(score, 1.0)
+    return min(
+        score,
+        1.0
+    )
 
-
-# ============================================================
-# DOCUMENT SEARCH
-# ============================================================
 
 def search_documents(
     query: str,
     limit: int = 5
 ):
-
     query = (query or "").strip()
 
     if not query:
@@ -245,22 +203,18 @@ def search_documents(
         return []
 
     try:
-
         documents = load_documents()
 
     except Exception as e:
-
         print(
             "DATA LOAD ERROR:",
             repr(e)
         )
-
         return []
 
     results = []
 
     for document in documents:
-
         question = document.get(
             "question",
             ""
@@ -298,25 +252,18 @@ def search_documents(
                     "text",
                     ""
                 ),
-
                 "question": question,
-
                 "answer": answer,
-
                 "paragraph": paragraph,
-
                 "title": title,
-
                 "language": document.get(
                     "language",
                     ""
                 ),
-
                 "source": document.get(
                     "source",
                     ""
                 ),
-
                 "score": float(score)
             }
         )
